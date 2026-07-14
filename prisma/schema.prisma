@@ -1,0 +1,416 @@
+// AutoAds AI — data model.
+// Phase 0 creates the whole tree so relations settle once; later phases only add fields.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MANAGER
+  EMPLOYEE
+}
+
+/// Phase 4 — the tenant. Every user, client, and campaign belongs to exactly one.
+/// A solo user is just an agency of one, so there is no second code path.
+model Agency {
+  id   String @id @default(cuid())
+  name String
+  /// Used for the white-label subdomain: {slug}.autoads.ai
+  slug String @unique
+
+  // --- White-label branding ---
+  logoUrl      String?
+  /// Hex, e.g. "#1E5631". Drives the accent colour and report headers.
+  brandColor   String?
+  customDomain String? @unique
+  /// Overrides the product name on client-facing reports.
+  reportHeader String?
+
+  users        User[]
+  clients      Client[]
+  invites      Invite[]
+  subscription Subscription?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  // Null for users who only ever sign in with Facebook OAuth.
+  passwordHash  String?
+  emailVerified DateTime?
+  image         String?
+  role          Role      @default(OWNER)
+  agencyId      String?
+
+  agency   Agency?   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  metaAuth MetaAuth?
+  clients  Client[]
+  accounts Account[]
+  sessions Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agencyId])
+}
+
+/// Phase 4 — a pending team invitation.
+model Invite {
+  id       String @id @default(cuid())
+  agencyId String
+  email    String
+  role     Role   @default(EMPLOYEE)
+  /// Random, single-use. The invite link carries this, not the invite id.
+  token    String @unique
+
+  expiresAt  DateTime
+  acceptedAt DateTime?
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  // One outstanding invite per email per agency.
+  @@unique([agencyId, email])
+  @@index([agencyId])
+}
+
+// --- Auth.js tables (required by @auth/prisma-adapter) ---
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// --- Product tables ---
+
+/// A business being advertised.
+model Client {
+  id         String @id @default(cuid())
+  /// The tenant. Every query in the app is scoped by this.
+  agencyId   String
+  /// Who created it. Kept for attribution; authorisation uses agencyId.
+  ownerId    String
+  name       String
+  websiteUrl String
+  /// AI website analysis result (Phase 1).
+  analysis   Json?
+
+  // --- Phase 4: where this client's reports go ---
+  contactEmail   String?
+  /// E.164-ish, with country code. WhatsApp needs digits only; we normalise on send.
+  contactPhone   String?
+  reportsEnabled Boolean @default(true)
+
+  // --- Phase 4: per-client Meta destination ---
+  // The Facebook *token* stays on the user who connected it (MetaAuth). What varies
+  // per client is where its ads go. Null falls back to the connecting user's default.
+  /// Whose MetaAuth token publishes this client. Needed by background jobs, which
+  /// have no logged-in user to borrow a token from.
+  metaAuthUserId   String?
+  metaAdAccountId  String?
+  metaPageId       String?
+  metaIgAccountId  String?
+  metaPixelId      String?
+
+  // --- Phase 3 autopilot controls ---
+  /// Master switch. Off means the optimiser only observes; it never acts.
+  autopilot       Boolean @default(false)
+  /// When true, actions are logged as PENDING and wait for a human click.
+  requireApproval Boolean @default(true)
+  /// Hard ceiling on total daily spend across this client's campaigns, in paise.
+  /// The optimiser will never raise a budget past this, whatever the rules say.
+  maxDailyBudget  Int?
+
+  agency           Agency             @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  owner            User               @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  campaigns        Campaign[]
+  generationJobs   GenerationJob[]
+  optimizationLogs OptimizationLog[]
+  reports          Report[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // One client per website per agency, so re-generating for the same URL updates
+  // the existing client instead of creating a duplicate for a colleague.
+  @@unique([agencyId, websiteUrl])
+  @@index([agencyId])
+  @@index([ownerId])
+}
+
+/// One run of the Phase 1 generation wizard.
+model GenerationJob {
+  id           String @id @default(cuid())
+  clientId     String
+  /// Stored in the smallest currency unit (paise) to avoid float drift.
+  budgetPerDay Int
+  /// LEAD_GEN | TRAFFIC | AWARENESS
+  goal         String
+
+  headlines    Json?
+  primaryTexts Json?
+  images       Json?
+  videos       Json?
+  audience     Json?
+  budgetSplit  Json?
+  structure    Json?
+
+  /// GENERATING while the wizard is mid-run, DRAFT once the user saves it.
+  status String @default("GENERATING")
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+}
+
+/// Phase 2 — the user's Meta connection.
+model MetaAuth {
+  id          String    @id @default(cuid())
+  userId      String    @unique
+  /// Long-lived user token (~60 days). Re-connect when it expires.
+  accessToken String    @db.Text
+  /// Denormalised so we don't re-fetch names on every settings render.
+  adAccountId String?
+  adAccountName String?
+  /// Meta bills in the ad account's currency; budgets must be sent in its minor unit.
+  currency    String?
+  pageId      String?
+  pageName    String?
+  igAccountId String?
+  /// Required for lead-optimised campaigns; without it Meta rejects the ad set.
+  pixelId     String?
+  expiresAt   DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Campaign {
+  id             String  @id @default(cuid())
+  clientId       String
+  /// The draft this was published from.
+  generationJobId String?
+  metaCampaignId String?
+  name           String
+  objective      String
+  /// PAUSED until the user explicitly activates it. Never default to ACTIVE.
+  status         String  @default("PAUSED")
+  /// Minor currency units per day (paise for INR).
+  dailyBudget    Int
+
+  // --- Phase 4 scheduling. Null means "no schedule; manual control only". ---
+  /// Activate automatically at this time.
+  startAt DateTime?
+  /// Pause automatically at this time. A hard stop on spend.
+  endAt   DateTime?
+
+  client  Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  adSets  AdSet[]
+  metrics Metric[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+}
+
+model AdSet {
+  id          String  @id @default(cuid())
+  campaignId  String
+  metaAdSetId String?
+  name        String
+  /// Minor currency units per day.
+  dailyBudget Int
+  status      String  @default("PAUSED")
+  audience    Json
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  ads      Ad[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([campaignId])
+}
+
+model Ad {
+  id            String  @id @default(cuid())
+  adSetId       String
+  metaAdId      String?
+  metaCreativeId String?
+  name          String
+  creativeUrl   String
+  copy          Json
+  status        String  @default("PAUSED")
+  /// Set when the optimiser pauses an ad, so the timeline can explain itself and
+  /// the creative-regeneration step knows what to replace.
+  pausedReason  String?
+
+  adSet   AdSet      @relation(fields: [adSetId], references: [id], onDelete: Cascade)
+  metrics AdMetric[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([adSetId])
+}
+
+/// Phase 3 — daily per-ad snapshot. The rules engine reads these, not Meta directly,
+/// so a decision can always be traced back to the numbers that caused it.
+model AdMetric {
+  id          String   @id @default(cuid())
+  adId        String
+  date        DateTime @db.Date
+  spend       Float
+  impressions Int
+  clicks      Int
+  ctr         Float
+  cpc         Float
+  leads       Int      @default(0)
+  cpl         Float?
+
+  ad Ad @relation(fields: [adId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([adId, date])
+  @@index([adId])
+}
+
+/// Phase 3 — every automated decision, with the reason and enough state to undo it.
+model OptimizationLog {
+  id         String  @id @default(cuid())
+  clientId   String
+  campaignId String?
+  adSetId    String?
+  adId       String?
+
+  /// PAUSE_AD | RAISE_BUDGET | LOWER_BUDGET | QUEUE_CREATIVE | KEEP_WINNER
+  action     String
+  /// Written for the user: "Paused Ad B — CTR 0.8% over 4,000 impressions".
+  reason     String
+  /// The value before the change, so the action can be reversed.
+  previous   Json?
+  next       Json?
+  /// PENDING | APPLIED | REVERTED | FAILED | SKIPPED
+  status     String  @default("APPLIED")
+  error      String?
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([clientId, createdAt])
+}
+
+/// Phase 3 — one row per campaign per day.
+model Metric {
+  id          String   @id @default(cuid())
+  campaignId  String
+  date        DateTime @db.Date
+  spend       Float
+  impressions Int
+  clicks      Int
+  ctr         Float
+  cpc         Float
+  cpl         Float?
+  roas        Float?
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([campaignId, date])
+  @@index([campaignId])
+}
+
+/// Phase 4 — billing. One per agency.
+model Subscription {
+  id       String @id @default(cuid())
+  agencyId String @unique
+  /// FREE | STARTER | GROWTH | AGENCY — see lib/billing/plans.ts
+  plan     String @default("FREE")
+  /// created | active | halted | cancelled | past_due — mirrors Razorpay.
+  status   String @default("active")
+
+  razorpaySubId    String?   @unique
+  currentPeriodEnd DateTime?
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Phase 4 — a generated client report, kept so it can be re-sent or re-read.
+model Report {
+  id          String   @id @default(cuid())
+  clientId    String
+  periodStart DateTime
+  periodEnd   DateTime
+  /// Rendered, self-contained HTML — the same body the email and the web view use.
+  html        String   @db.Text
+  /// Totals, so the cross-client dashboard doesn't re-parse the HTML.
+  summary     Json
+
+  emailedAt   DateTime?
+  whatsappAt  DateTime?
+  deliveryError String?
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([clientId, periodEnd])
+}

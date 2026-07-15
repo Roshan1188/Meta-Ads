@@ -15,10 +15,13 @@ import type { z } from "zod";
 // or 429 quota on one model), the next one usually goes through. `gemini-flash-latest`
 // is an evergreen alias; the rest are concrete fallbacks. Override the first with
 // GEMINI_MODEL.
+// Lite models first: they carry the highest free-tier quota, so on the free plan
+// they're the reliable default. The full flash model has better quality but a much
+// smaller free allowance and 429s quickly — it's the last resort here.
 const MODEL_CHAIN = [
-  process.env.GEMINI_MODEL ?? "gemini-flash-latest",
-  "gemini-flash-lite-latest",
+  process.env.GEMINI_MODEL ?? "gemini-flash-lite-latest",
   "gemini-2.0-flash-lite",
+  "gemini-flash-latest",
 ];
 
 export const GEMINI_MODEL = MODEL_CHAIN[0];

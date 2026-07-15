@@ -1,6 +1,4 @@
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-
-import { anthropic, COPY_MODEL, isAnthropicConfigured } from "./anthropic";
+import { generateStructured, isAiConfigured } from "./llm";
 import { mockAnalysis } from "./mock";
 import { fetchSiteText } from "./scrape";
 import { websiteAnalysisSchema, type WebsiteAnalysis } from "./schemas";
@@ -8,7 +6,7 @@ import { websiteAnalysisSchema, type WebsiteAnalysis } from "./schemas";
 export type AnalysisResult = {
   url: string;
   analysis: WebsiteAnalysis;
-  /** True when ANTHROPIC_API_KEY is absent and this is placeholder data. */
+  /** True when no AI provider is configured and this is placeholder data. */
   mocked: boolean;
 };
 
@@ -19,37 +17,21 @@ Report only what the page actually supports. Do not invent services, locations, 
 claims the text does not make — a fabricated value proposition becomes a false ad.
 If the site never states a location, return "Unknown" rather than guessing.`;
 
-/** Fetches the site, then has Claude turn it into a structured brief. */
+/** Fetches the site, then turns it into a structured brief. */
 export async function analyseWebsite(rawUrl: string): Promise<AnalysisResult> {
   const { url, text } = await fetchSiteText(rawUrl);
 
-  if (!isAnthropicConfigured) {
+  if (!isAiConfigured) {
     return { url, analysis: mockAnalysis(url), mocked: true };
   }
 
-  const response = await anthropic().messages.parse({
-    model: COPY_MODEL,
-    max_tokens: 4096,
-    thinking: { type: "adaptive" },
-    output_config: {
-      effort: "medium",
-      format: zodOutputFormat(websiteAnalysisSchema),
-    },
+  const analysis = await generateStructured({
     system: SYSTEM,
-    messages: [
-      {
-        role: "user",
-        content: `Website: ${url}\n\nPage text:\n"""\n${text}\n"""\n\nProfile this business.`,
-      },
-    ],
+    user: `Website: ${url}\n\nPage text:\n"""\n${text}\n"""\n\nProfile this business.`,
+    schema: websiteAnalysisSchema,
+    effort: "medium",
+    maxTokens: 4096,
   });
 
-  if (response.stop_reason === "refusal") {
-    throw new Error("Claude declined to analyse that website.");
-  }
-  if (!response.parsed_output) {
-    throw new Error("Claude returned an unusable analysis. Try again.");
-  }
-
-  return { url, analysis: response.parsed_output, mocked: false };
+  return { url, analysis, mocked: false };
 }

@@ -1,6 +1,4 @@
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-
-import { anthropic, COPY_MODEL, isAnthropicConfigured } from "./anthropic";
+import { generateStructured, isAiConfigured } from "./llm";
 import { mockCopy } from "./mock";
 import {
   adCopySchema,
@@ -31,37 +29,24 @@ export async function generateCopy(
   analysis: WebsiteAnalysis,
   goal: Goal,
 ): Promise<CopyResult> {
-  if (!isAnthropicConfigured) {
+  if (!isAiConfigured) {
     return { copy: mockCopy(analysis), mocked: true };
   }
 
-  const response = await anthropic().messages.parse({
-    model: COPY_MODEL,
-    max_tokens: 8192,
-    thinking: { type: "adaptive" },
-    output_config: { effort: "high", format: zodOutputFormat(adCopySchema) },
+  const copy = await generateStructured({
     system: SYSTEM,
-    messages: [
-      {
-        role: "user",
-        content: `Campaign goal: ${GOAL_LABELS[goal]}
+    user: `Campaign goal: ${GOAL_LABELS[goal]}
 
 Business brief:
 ${JSON.stringify(analysis, null, 2)}
 
 Write the ad copy and image prompts.`,
-      },
-    ],
+    schema: adCopySchema,
+    effort: "high",
+    maxTokens: 8192,
   });
 
-  if (response.stop_reason === "refusal") {
-    throw new Error("Claude declined to write copy for that business.");
-  }
-  if (!response.parsed_output) {
-    throw new Error("Claude returned unusable copy. Try again.");
-  }
-
-  return { copy: enforceLengths(response.parsed_output), mocked: false };
+  return { copy: enforceLengths(copy), mocked: false };
 }
 
 /**

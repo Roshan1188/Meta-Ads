@@ -1,6 +1,4 @@
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-
-import { anthropic, COPY_MODEL, isAnthropicConfigured } from "./anthropic";
+import { generateStructured, isAiConfigured } from "./llm";
 import { mockPlan } from "./mock";
 import {
   campaignPlanSchema,
@@ -31,20 +29,13 @@ export async function generatePlan(
   goal: Goal,
   dailyBudgetPaise: number,
 ): Promise<PlanResult> {
-  if (!isAnthropicConfigured) {
+  if (!isAiConfigured) {
     return { plan: mockPlan(analysis, goal), mocked: true };
   }
 
-  const response = await anthropic().messages.parse({
-    model: COPY_MODEL,
-    max_tokens: 6144,
-    thinking: { type: "adaptive" },
-    output_config: { effort: "high", format: zodOutputFormat(campaignPlanSchema) },
+  const plan = await generateStructured({
     system: SYSTEM,
-    messages: [
-      {
-        role: "user",
-        content: `Campaign goal: ${GOAL_LABELS[goal]}
+    user: `Campaign goal: ${GOAL_LABELS[goal]}
 Required Meta objective: ${GOAL_TO_META_OBJECTIVE[goal]}
 Daily budget: ${formatRupees(dailyBudgetPaise)}
 
@@ -52,18 +43,12 @@ Business brief:
 ${JSON.stringify(analysis, null, 2)}
 
 Plan the audience, the budget split, and the campaign structure.`,
-      },
-    ],
+    schema: campaignPlanSchema,
+    effort: "high",
+    maxTokens: 6144,
   });
 
-  if (response.stop_reason === "refusal") {
-    throw new Error("Claude declined to plan that campaign.");
-  }
-  if (!response.parsed_output) {
-    throw new Error("Claude returned an unusable plan. Try again.");
-  }
-
-  return { plan: normalise(response.parsed_output, goal), mocked: false };
+  return { plan: normalise(plan, goal), mocked: false };
 }
 
 /**

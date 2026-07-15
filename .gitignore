@@ -44,3 +44,7 @@ next-env.d.ts
 !.env.example
 .vercel
 .env*
+
+# ad-hoc test artifacts
+/_*.json
+/_*.txt

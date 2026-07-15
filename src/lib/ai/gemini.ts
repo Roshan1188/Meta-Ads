@@ -105,6 +105,14 @@ function toGeminiSchema(schema: z.ZodType): Record<string, unknown> {
  * Gemini is asked for JSON, then the raw text is re-parsed through the Zod schema —
  * so a malformed model response can never reach the rest of the app.
  */
+// The free tier congests in bursts — a 503 on all models one second can clear the
+// next. Make several passes through the model chain with growing backoff so a single
+// generation survives a transient spike instead of failing on the first bad window.
+const MAX_ROUNDS = 3;
+const ROUND_BACKOFF_MS = 4_000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export async function generateStructuredGemini<T>(input: {
   system: string;
   user: string;
@@ -113,51 +121,57 @@ export async function generateStructuredGemini<T>(input: {
   const responseJsonSchema = toGeminiSchema(input.schema);
   let lastError: unknown;
 
-  for (const model of MODEL_CHAIN) {
-    try {
-      const response = await withTimeout(
-        gemini().models.generateContent({
-          model,
-          contents: [{ role: "user", parts: [{ text: input.user }] }],
-          config: {
-            systemInstruction: input.system,
-            responseMimeType: "application/json",
-            responseJsonSchema,
-            temperature: 0.8,
-          },
-        }),
-        REQUEST_TIMEOUT_MS,
-      );
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    if (round > 0) await sleep(ROUND_BACKOFF_MS * round);
 
-      const text = response.text;
-      if (!text) throw new Error("Gemini returned an empty response.");
-
-      let parsed: unknown;
+    for (const model of MODEL_CHAIN) {
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        throw new Error("Gemini returned invalid JSON.");
-      }
+        const response = await withTimeout(
+          gemini().models.generateContent({
+            model,
+            contents: [{ role: "user", parts: [{ text: input.user }] }],
+            config: {
+              systemInstruction: input.system,
+              responseMimeType: "application/json",
+              responseJsonSchema,
+              temperature: 0.8,
+            },
+          }),
+          REQUEST_TIMEOUT_MS,
+        );
 
-      const result = input.schema.safeParse(parsed);
-      if (!result.success) {
-        const detail = result.error.issues
-          .slice(0, 4)
-          .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
-          .join("; ");
-        const keys =
-          parsed && typeof parsed === "object" ? Object.keys(parsed).join(",") : typeof parsed;
-        // Bad shape from one model can genuinely improve on another (they format
-        // differently), so treat it as retryable across the chain.
-        throw new Error(`SHAPE_MISMATCH [got keys: ${keys}] ${detail}`);
-      }
+        const text = response.text;
+        if (!text) throw new Error("Gemini returned an empty response.");
 
-      return result.data;
-    } catch (error) {
-      lastError = error;
-      // Only move to the next model for transient/availability errors; a bad-shape,
-      // empty, auth, or bad-request error won't improve elsewhere.
-      if (!shouldTryNextModel(error)) throw error;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new Error("Gemini returned invalid JSON.");
+        }
+
+        const result = input.schema.safeParse(parsed);
+        if (!result.success) {
+          const detail = result.error.issues
+            .slice(0, 4)
+            .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+            .join("; ");
+          const keys =
+            parsed && typeof parsed === "object"
+              ? Object.keys(parsed).join(",")
+              : typeof parsed;
+          // Bad shape from one model can genuinely improve on another (they format
+          // differently), so treat it as retryable across the chain.
+          throw new Error(`SHAPE_MISMATCH [got keys: ${keys}] ${detail}`);
+        }
+
+        return result.data;
+      } catch (error) {
+        lastError = error;
+        // Only keep going for transient/availability/shape errors; an auth or
+        // bad-request error won't improve on another model or another round.
+        if (!shouldTryNextModel(error)) throw error;
+      }
     }
   }
 

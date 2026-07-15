@@ -31,7 +31,7 @@ export const GEMINI_MODEL = MODEL_CHAIN[0];
  */
 function shouldTryNextModel(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /\b(429|500|503|504|UNAVAILABLE|RESOURCE_EXHAUSTED|NOT_FOUND|DEADLINE|overloaded|high demand|quota|not found|not available)\b/i.test(
+  return /\b(429|500|503|504|UNAVAILABLE|RESOURCE_EXHAUSTED|NOT_FOUND|DEADLINE|overloaded|high demand|quota|not found|not available|SHAPE_MISMATCH)\b/i.test(
     message,
   );
 }
@@ -138,9 +138,15 @@ export async function generateStructuredGemini<T>(input: {
 
       const result = input.schema.safeParse(parsed);
       if (!result.success) {
-        throw new Error(
-          `Gemini's response didn't match the expected shape: ${result.error.issues[0]?.message}`,
-        );
+        const detail = result.error.issues
+          .slice(0, 4)
+          .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+          .join("; ");
+        const keys =
+          parsed && typeof parsed === "object" ? Object.keys(parsed).join(",") : typeof parsed;
+        // Bad shape from one model can genuinely improve on another (they format
+        // differently), so treat it as retryable across the chain.
+        throw new Error(`SHAPE_MISMATCH [got keys: ${keys}] ${detail}`);
       }
 
       return result.data;
